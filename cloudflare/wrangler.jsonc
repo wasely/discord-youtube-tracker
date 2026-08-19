@@ -10,6 +10,20 @@
   "vars": {
     "PUBLIC_TRANSCRIPT_ORIGIN": "https://discord-youtube-transcripts.kaiguy432.workers.dev"
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FAST_INTAKE",
+        "class_name": "FastIntakeCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FastIntakeCoordinator"]
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

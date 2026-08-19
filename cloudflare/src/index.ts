@@ -2,6 +2,7 @@ import { verifyKey } from "discord-interactions";
 
 interface Env {
   DB: D1Database;
+  FAST_INTAKE?: DurableObjectNamespace;
   DISCORD_TOKEN: string;
   DISCORD_PUBLIC_KEY: string;
   DISCORD_APPLICATION_ID: string;
@@ -171,7 +172,7 @@ const MAX_CACHED_CAPTION_BYTES = 1_800_000;
 const TRANSCRIPT_SEGMENT_BATCH_SIZE = 10;
 const YOUTUBE_WATCH_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const YOUTUBE_ANDROID_USER_AGENT = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip";
-const DEPLOYMENT_VERSION = "transcripts-4";
+const DEPLOYMENT_VERSION = "transcripts-5";
 const FEED_CATEGORY_NAMES = ["ai video feeds", "ai labs & platforms"];
 const SUMMARY_CHANNEL_NAME = "summary";
 const SUMMARY_CHANNEL_TOPIC = "Deep, transcript-grounded video summaries and follow-up questions.";
@@ -1943,10 +1944,11 @@ async function discoverTranscriptRequests(env: Env, channelId: string): Promise<
 
 async function processTranscriptRequest(env: Env, request: TranscriptIntakeRequest): Promise<void> {
   const now = new Date().toISOString();
-  await env.DB.prepare(
+  const claim = await env.DB.prepare(
     `UPDATE transcript_intake_requests SET status = 'running', attempts = attempts + 1, updated_at = ?
-     WHERE message_id = ? AND video_id = ?`,
+     WHERE message_id = ? AND video_id = ? AND status IN ('queued', 'retrying')`,
   ).bind(now, request.message_id, request.video_id).run();
+  if (!claim.meta.changes) return;
   try {
     const captions = await getCaptions(env, request.video_id);
     const metadata = {
@@ -2095,10 +2097,11 @@ async function discoverSummaryRequests(env: Env, guildId: string, channelId: str
 
 async function processSummaryRequest(env: Env, request: SummaryIntakeRequest): Promise<void> {
   const now = new Date().toISOString();
-  await env.DB.prepare(
+  const claim = await env.DB.prepare(
     `UPDATE summary_intake_requests SET status = 'running', attempts = attempts + 1, updated_at = ?
-     WHERE message_id = ? AND video_id = ?`,
+     WHERE message_id = ? AND video_id = ? AND status IN ('queued', 'retrying')`,
   ).bind(now, request.message_id, request.video_id).run();
+  if (!claim.meta.changes) return;
   try {
     const source = await (await discordApi(
       env,
@@ -2193,6 +2196,114 @@ export async function runSummaryIntake(env: Env): Promise<number> {
   // the model quota and fail together.
   for (const request of due.results) await processSummaryRequest(env, request);
   return due.results.length;
+}
+
+interface FastIntakeChannels {
+  transcripts: Array<{ guildId: string; channelId: string }>;
+  summaries: Array<{ guildId: string; channelId: string }>;
+  refreshedAt: number;
+}
+
+async function discoverFastIntakeChannels(env: Env): Promise<FastIntakeChannels> {
+  let guilds: Array<{ id: string }> = [];
+  try {
+    guilds = await (await discordApi(env, "/users/@me/guilds?limit=200")).json() as Array<{ id: string }>;
+  } catch (error) {
+    logEvent("warn", "fast_intake_guild_discovery_failed", { error: error instanceof Error ? error.message : String(error) });
+  }
+  if (!guilds.length) {
+    const routes = await env.DB.prepare("SELECT DISTINCT guild_id AS id FROM routes WHERE guild_id IS NOT NULL").all<{ id: string }>();
+    guilds = routes.results;
+  }
+  const channels: FastIntakeChannels = { transcripts: [], summaries: [], refreshedAt: Date.now() };
+  for (const guild of guilds) {
+    try {
+      const [transcript, summary] = await Promise.all([
+        ensureTranscriptChannel(env, guild.id),
+        ensureSummaryChannel(env, guild.id),
+      ]);
+      channels.transcripts.push({ guildId: guild.id, channelId: transcript });
+      channels.summaries.push({ guildId: guild.id, channelId: summary });
+    } catch (error) {
+      logEvent("warn", "fast_intake_channel_discovery_failed", { guild_id: guild.id, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return channels;
+}
+
+export async function runFastIntake(env: Env, channels: FastIntakeChannels): Promise<{ transcripts: number; summaries: number }> {
+  await Promise.all([ensureTranscriptIntakeTable(env), ensureSummaryIntakeTable(env)]);
+  await env.DB.prepare(
+    `UPDATE transcript_intake_requests
+     SET status = 'queued', attempts = 0, next_attempt_at = NULL, last_error = NULL, updated_at = ?
+     WHERE status = 'failed' AND EXISTS (
+       SELECT 1 FROM captions WHERE captions.video_id = transcript_intake_requests.video_id
+     )`,
+  ).bind(new Date().toISOString()).run();
+  await Promise.all([
+    ...channels.transcripts.map(({ channelId }) => discoverTranscriptRequests(env, channelId)),
+    ...channels.summaries.map(({ guildId, channelId }) => discoverSummaryRequests(env, guildId, channelId)),
+  ]);
+  const now = new Date().toISOString();
+  const [transcriptRows, summaryRows] = await Promise.all([
+    env.DB.prepare(
+      `SELECT message_id, channel_id, video_id, attempts FROM transcript_intake_requests
+       WHERE status IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ORDER BY created_at LIMIT 4`,
+    ).bind(now).all<TranscriptIntakeRequest>(),
+    env.DB.prepare(
+      `SELECT message_id, channel_id, guild_id, video_id, attempts FROM summary_intake_requests
+       WHERE status IN ('queued', 'retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ORDER BY created_at LIMIT 2`,
+    ).bind(now).all<SummaryIntakeRequest>(),
+  ]);
+  await Promise.all(transcriptRows.results.map((request) => processTranscriptRequest(env, request)));
+  for (const request of summaryRows.results) await processSummaryRequest(env, request);
+  return { transcripts: transcriptRows.results.length, summaries: summaryRows.results.length };
+}
+
+export class FastIntakeCoordinator {
+  private readonly state: DurableObjectState;
+  private readonly env: Env;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path === "/status") {
+      const channels = await this.state.storage.get<FastIntakeChannels>("channels");
+      return json({ ok: true, alarm: await this.state.storage.getAlarm(), channels });
+    }
+    if (path !== "/start" || request.method !== "POST") return new Response("Not found", { status: 404 });
+    if (!await this.state.storage.getAlarm()) await this.state.storage.setAlarm(Date.now() + 1_000);
+    return json({ ok: true });
+  }
+
+  async alarm(): Promise<void> {
+    try {
+      let channels = await this.state.storage.get<FastIntakeChannels>("channels");
+      if (!channels || Date.now() - channels.refreshedAt > 10 * 60_000) {
+        channels = await discoverFastIntakeChannels(this.env);
+        await this.state.storage.put("channels", channels);
+      }
+      const result = await runFastIntake(this.env, channels);
+      if (result.transcripts || result.summaries) logEvent("info", "fast_intake_complete", result);
+    } catch (error) {
+      logEvent("error", "fast_intake_failed", { error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      await this.state.storage.setAlarm(Date.now() + 5_000);
+    }
+  }
+}
+
+async function ensureFastIntake(env: Env): Promise<void> {
+  if (!env.FAST_INTAKE) return;
+  const id = env.FAST_INTAKE.idFromName("primary");
+  const response = await env.FAST_INTAKE.get(id).fetch("https://fast-intake/start", { method: "POST" });
+  if (!response.ok) throw new Error(`Fast intake start failed: ${response.status}`);
 }
 
 async function addChannel(env: Env, interaction: DiscordInteraction, input: string): Promise<string> {
@@ -2771,7 +2882,12 @@ export default {
       if (url.pathname === "/health") {
         try {
           await env.DB.prepare("SELECT 1").first();
-          return json({ status: "ok", service: PRODUCT_NAME, version: DEPLOYMENT_VERSION, database: "ok" });
+          let fastIntake: unknown = "not configured";
+          if (env.FAST_INTAKE) {
+            const id = env.FAST_INTAKE.idFromName("primary");
+            fastIntake = await (await env.FAST_INTAKE.get(id).fetch("https://fast-intake/status")).json();
+          }
+          return json({ status: "ok", service: PRODUCT_NAME, version: DEPLOYMENT_VERSION, database: "ok", fastIntake });
         } catch {
           return json({ status: "degraded", service: PRODUCT_NAME, version: DEPLOYMENT_VERSION, database: "unavailable" }, 503);
         }
@@ -2828,10 +2944,9 @@ export default {
         })));
       return;
     }
+    ctx.waitUntil(ensureFastIntake(env));
     ctx.waitUntil(Promise.all([
       runPoll(env).then((posted) => console.log(`Poll complete: ${posted} new video(s)`)),
-      runTranscriptIntake(env).then((processed) => console.log(`Transcript intake: ${processed} request(s)`)),
-      runSummaryIntake(env).then((processed) => console.log(`Summary intake: ${processed} request(s)`)),
     ]).then(() => undefined));
   },
 };

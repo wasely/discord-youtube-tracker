@@ -62,7 +62,7 @@ Run the bot:
 python run.py
 ```
 
-The local bot creates or repairs `#youtube-transcripts` and replies immediately while running. The Cloudflare Worker polls both `#youtube-transcripts` and `#summary` every minute, so pasted links still work when the home computer is off. Set `LOCAL_FEED_POLLING=true` only when Python should also poll creator feeds.
+The local bot creates or repairs `#youtube-transcripts` and replies immediately while running. The Cloudflare Durable Object polls both `#youtube-transcripts` and `#summary` about every five seconds, so pasted links stay fast when the home computer is off. Creator feeds still poll every minute. Set `LOCAL_FEED_POLLING=true` only when Python should also poll creator feeds.
 
 Docker files are included for containerized operation:
 
@@ -73,9 +73,9 @@ docker compose up --build -d
 ## Free 24/7 cloud deployment
 
 The `cloudflare/` app is the always-on deployment. It uses a Cloudflare Worker,
-one-minute Cron Trigger, and D1 for persistent routes, checkpoints, cached
-captions, and a restart-safe pending-post queue. It needs no open browser or
-home computer.
+five-second Durable Object alarms for Discord intake, a one-minute Cron Trigger for
+creator feeds and self-healing, and D1 for persistent routes, checkpoints, cached
+captions, and restart-safe queues. It needs no open browser or home computer.
 
 One Worker owns everything: feed polling, Discord interactions, transcript
 intake, transcript and copy pages, and summaries.
