@@ -139,8 +139,10 @@ interface SummaryIntakeRequest extends TranscriptIntakeRequest {
 const DISCORD_API = "https://discord.com/api/v10";
 const PRODUCT_NAME = "Discord YouTube Tracker";
 const MANAGE_GUILD = 32n;
-const POLL_BATCH_SIZE = 20;
-const SEND_BATCH_SIZE = 8;
+// Free-plan Workers get ~10ms CPU per invocation; feed parsing across 20
+// channels blew through it on every run, so the rotation is spread thinner.
+const POLL_BATCH_SIZE = 4;
+const SEND_BATCH_SIZE = 3;
 const MAX_SEND_ATTEMPTS = 6;
 const REQUEST_TIMEOUT_MS = 15_000;
 const CAPTION_BUTTON_PREFIX = "captions:";
@@ -157,7 +159,7 @@ const CHAT_TRANSCRIPT_SPACING_MS = 400;
 const EPHEMERAL_FLAG = 64;
 const SUPPRESS_EMBEDS_FLAG = 4;
 const CARD_UPGRADE_CRON = "*/2 * * * *";
-const CARD_UPGRADE_CHANNELS_PER_RUN = 6;
+const CARD_UPGRADE_CHANNELS_PER_RUN = 1;
 const CARD_UPGRADE_PATCHES_PER_CHANNEL = 3;
 const CARD_UPGRADE_PAGE_SIZE = 50;
 const CARD_UPGRADE_PATCH_SPACING_MS = 900;
