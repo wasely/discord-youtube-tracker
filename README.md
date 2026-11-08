@@ -1,3 +1,9 @@
+> [!NOTE]
+> **This copy is archived. The maintained project lives at [blixvip/discord-youtube-tracker](https://github.com/blixvip/discord-youtube-tracker).**
+> Issues, releases and pull requests all happen there. Contributors are welcome:
+> see its [good first issues](https://github.com/blixvip/discord-youtube-tracker/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+> and the [Discord](https://discord.gg/grokbot).
+
 # Discord YouTube Tracker
 
 A Discord bot that watches YouTube creators, routes new uploads into organized Discord channels, and optionally fetches Reddit memes.
